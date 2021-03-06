@@ -130,27 +130,61 @@ async def datagram_handler(writer, data, addr, protos, urserver, block, cipher, 
 async def check_server_alive(interval, rserver, verbose):
     while True:
         await asyncio.sleep(interval)
+        await check_servers(rserver, verbose)
+
+
+async def check_servers(rserver, verbose):
+    for remote in rserver:
+        if type(remote) is ProxyDirect:
+            continue
+        try:
+            _, writer = await remote.open_connection(None, None, None, None, timeout=3)
+        except asyncio.CancelledError as ex:
+            return
+        except Exception as ex:
+            if remote.alive:
+                verbose(f'{remote.rproto.name} {remote.bind} -> OFFLINE')
+                remote.alive = False
+            continue
+        if not remote.alive:
+            verbose(f'{remote.rproto.name} {remote.bind} -> ONLINE')
+            remote.alive = True
+        try:
+            if isinstance(remote, ProxyBackward):
+                writer.write(b'\x00')
+            writer.close()
+        except Exception:
+            pass
+
+
+def load_servers(proxyfile):
+    with open(proxyfile) as f:
+        content = f.read().splitlines()
+        return [proxies_by_uri(r if r.find(':') == -1 else f"http://{r}") for r in content]
+
+
+async def reload_servers(proxyfile, interval, rserver, verbose):
+    while True:
+        await asyncio.sleep(interval)
+
+        rservers_dict = {str(r): r for r in load_servers(proxyfile)}
+
         for remote in rserver:
             if type(remote) is ProxyDirect:
                 continue
-            try:
-                _, writer = await remote.open_connection(None, None, None, None, timeout=3)
-            except asyncio.CancelledError as ex:
-                return
-            except Exception as ex:
-                if remote.alive:
-                    verbose(f'{remote.rproto.name} {remote.bind} -> OFFLINE')
-                    remote.alive = False
-                continue
-            if not remote.alive:
-                verbose(f'{remote.rproto.name} {remote.bind} -> ONLINE')
-                remote.alive = True
-            try:
-                if isinstance(remote, ProxyBackward):
-                    writer.write(b'\x00')
-                writer.close()
-            except Exception:
-                pass
+            s = str(remote)
+            if s not in rservers_dict:
+                rserver.remove(remote)
+                verbose(f'{remote.rproto.name} {remote.bind} -> REMOVED')
+            else:
+                del rservers_dict[s]
+
+        for remote in rservers_dict.values():
+            verbose(f'{remote.rproto.name} {remote.bind} -> ADDED')
+            rserver.append(remote)
+
+        # await check_servers(rserver, verbose)
+
 
 class ProxyDirect(object):
     def __init__(self, lbind=None):
@@ -256,6 +290,10 @@ class ProxySimple(ProxyDirect):
         self.sslclient = sslclient
         self.sslserver = sslserver
         self.jump = jump
+
+    def __str__(self):
+        return f'{self.rproto.name}://{self.bind}'
+
     def logtext(self, host, port):
         return f' -> {self.rproto.name+("+ssl" if self.sslclient else "")} {self.bind}' + self.jump.logtext(host, port)
     def match_rule(self, host, port):
@@ -894,6 +932,9 @@ def main():
     parser.add_argument('--daemon', dest='daemon', action='store_true', help='run as a daemon (Linux only)')
     parser.add_argument('--test', help='test this url for all remote proxies and exit')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
+    parser.add_argument('--proxylist', dest='proxyfile', default=None, type=str, help='reload remote servers from file')
+    parser.add_argument('--proxylist-reload', dest='proxyfile_reload', default=0, type=int, help='interval to reload proxylist (default: no reload)')
+
     args = parser.parse_args()
     if args.sslfile:
         sslfile = args.sslfile.split(',')
@@ -936,6 +977,10 @@ def main():
         from . import verbose
         verbose.setup(loop, args)
     servers = []
+
+    if args.proxyfile:
+        args.rserver = load_servers(args.proxyfile)
+
     for option in args.listen:
         print('Serving on', option.bind, 'by', ",".join(i.name for i in option.protos) + ('(SSL)' if option.sslclient else ''), '({}{})'.format(option.cipher.name, ' '+','.join(i.name() for i in option.cipher.plugins) if option.cipher and option.cipher.plugins else '') if option.cipher else '')
         try:
@@ -958,12 +1003,17 @@ def main():
                 servers.append(server)
             except Exception as ex:
                 print('Start server failed.\n\t==>', ex)
+
     if servers:
         if args.sys:
             from . import sysproxy
             args.sys = sysproxy.setup(args)
         if args.alived > 0 and args.rserver:
             asyncio.ensure_future(check_server_alive(args.alived, args.rserver, args.verbose if args.v else DUMMY))
+
+        if args.proxyfile and args.proxyfile_reload:
+            asyncio.ensure_future(reload_servers(args.proxyfile, args.proxyfile_reload, args.rserver, args.verbose if args.v else DUMMY))
+
         try:
             loop.run_forever()
         except KeyboardInterrupt:
